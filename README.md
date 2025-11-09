@@ -48,8 +48,8 @@ utils/
 
 1. **Clone the repository:**
    ```sh
-   git clone <repo-url>
-   cd NetSentinel
+   git clone https://github.com/cyb3ritic/netsentinel.git
+   cd netsentinel
    ```
 
 2. **Run the installer:**
@@ -118,9 +118,6 @@ Follow the interactive menu to:
 
 Pull requests and issues are welcome! Please follow best practices for Bash scripting and security.
 
-## License
-
-MIT License
 
 ---
 
