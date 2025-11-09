@@ -1,0 +1,27 @@
+# Secrets and credentials
+.env
+*.log
+
+# Data files
+data/profiles/*.json
+data/trends/*.json
+data/reports/*.html
+data/scams_detected.json
+data/network_*.json
+data/cache/*
+
+# Logs
+logs/*.log
+
+# Temporary files
+*.tmp
+*.tmp2
+*~
+.DS_Store
+
+# Backup files
+*.bak
+*.backup
+
+# API tokens
+config/tokens.enc
