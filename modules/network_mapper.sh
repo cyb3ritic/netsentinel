@@ -1,8 +1,8 @@
 #!/bin/bash
 
 #############################################
-# Reddit Network Mapper - OPTIMIZED VERSION
-# With progress indicators and timeouts
+# Reddit Network Mapper - ACCURACY FIXED
+# Now detects actual user interactions
 #############################################
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -10,178 +10,198 @@ source "${SCRIPT_DIR}/config/config.sh"
 source "${SCRIPT_DIR}/utils/logger.sh"
 source "${SCRIPT_DIR}/utils/reddit_api.sh"
 
-# Progress spinner
-show_spinner() {
-    local pid=$1
-    local delay=0.1
-    local spinstr='|/-\'
-    
-    while ps -p $pid > /dev/null 2>&1; do
-        local temp=${spinstr#?}
-        printf " [%c]  " "$spinstr"
-        local spinstr=$temp${spinstr%"$temp"}
-        sleep $delay
-        printf "\b\b\b\b\b\b"
-    done
-    printf "    \b\b\b\b"
-}
-
 map_reddit_user_network() {
     local seed_username=$1
-    local depth=${2:-1}  # Reduced default depth to 1 for faster execution
-    local max_users=${3:-20}  # Limit total users to analyze
+    local depth=${2:-1}
+    local max_users=${3:-20}
     local output_file="${DATA_DIR}/network_${seed_username}_$(date +%Y%m%d_%H%M%S).json"
     
     log_info "Mapping Reddit network for u/${seed_username} (depth: ${depth}, max users: ${max_users})"
     
-    # Fetch seed user profile with timeout
-    log_info "Fetching seed user profile..."
-    local seed_profile=$(timeout 10 fetch_reddit_user "${seed_username}" 2>/dev/null)
-    
-    if [[ -z "${seed_profile}" ]] || [[ $? -ne 0 ]]; then
-        log_error "Failed to fetch seed user profile (timeout or API error)"
+    # Fetch seed user with retries
+    local retry_count=0
+    local seed_profile
+    while [[ ${retry_count} -lt 3 ]]; do
+        seed_profile=$(fetch_reddit_user "${seed_username}" 2>/dev/null)
+        if [[ -n "${seed_profile}" ]] && [[ $(echo "${seed_profile}" | jq -r '.error' 2>/dev/null) == "null" ]]; then
+            break
+        fi
+        log_warn "Retrying seed user fetch (attempt $((retry_count + 1)))"
+        sleep $((retry_count + 1))
+        ((retry_count++))
+    done
+
+    if [[ -z "${seed_profile}" ]]; then
+        log_error "Failed to fetch seed user profile after retries"
         return 1
     fi
-    
-    # Initialize network data structures
-    declare -A nodes
-    declare -A edges
-    declare -A visited_users
-    declare -A user_subreddits
-    declare -A interaction_count
-    
-    # Add seed node
+
+    # Initialize network structures
+    declare -A nodes edges visited_users interaction_types
     nodes["${seed_username}"]="seed"
     visited_users["${seed_username}"]=1
-    
-    # Counters
     local total_nodes=1
     local total_edges=0
-    local users_processed=0
+
+    # Fetch user activity
+    log_info "Analyzing user interactions..."
+    local comments_data posts_data
     
-    log_info "Analyzing user activity patterns..."
+    comments_data=$(timeout $((CURL_TIMEOUT * 2)) fetch_reddit_user_comments "${seed_username}" 50)
+    [[ $? -eq 124 ]] && log_warn "Comments fetch timed out"
     
-    # Analyze seed user's activity (limited to recent)
-    echo -n "  → Fetching comments..."
-    local comments_data=$(timeout 10 fetch_reddit_user_comments "${seed_username}" 25 2>/dev/null)
-    echo " ✓"
+    posts_data=$(timeout $((CURL_TIMEOUT * 2)) fetch_reddit_user_posts "${seed_username}" 50)
+    [[ $? -eq 124 ]] && log_warn "Posts fetch timed out"
+
+    echo ""
+    log_info "Finding users who interacted with u/${seed_username}..."
     
-    echo -n "  → Fetching posts..."
-    local posts_data=$(timeout 10 fetch_reddit_user_posts "${seed_username}" 25 2>/dev/null)
-    echo " ✓"
-    
-    if [[ -z "${comments_data}" ]] && [[ -z "${posts_data}" ]]; then
-        log_warn "No activity data found for user"
-    fi
-    
-    # Extract subreddits from user activity
-    local top_subreddits=()
-    
+    # METHOD 1: Find replies to seed user's comments
+    local replies_found=0
     if [[ -n "${comments_data}" ]]; then
         while read -r comment; do
+            local comment_id=$(echo "${comment}" | jq -r '.data.id' 2>/dev/null)
             local subreddit=$(echo "${comment}" | jq -r '.data.subreddit' 2>/dev/null)
-            [[ -n "${subreddit}" ]] && user_subreddits["${seed_username}:${subreddit}"]=$((${user_subreddits["${seed_username}:${subreddit}"]:-0} + 1))
-        done < <(echo "${comments_data}" | jq -c '.data.children[]?' 2>/dev/null)
-    fi
-    
-    if [[ -n "${posts_data}" ]]; then
-        while read -r post; do
-            local subreddit=$(echo "${post}" | jq -r '.data.subreddit' 2>/dev/null)
-            [[ -n "${subreddit}" ]] && user_subreddits["${seed_username}:${subreddit}"]=$((${user_subreddits["${seed_username}:${subreddit}"]:-0} + 1))
-        done < <(echo "${posts_data}" | jq -c '.data.children[]?' 2>/dev/null)
-    fi
-    
-    # Get top 2 most active subreddits (reduced from 3)
-    for key in "${!user_subreddits[@]}"; do
-        if [[ "${key}" == "${seed_username}:"* ]]; then
-            local sub=$(echo "${key}" | cut -d: -f2)
-            local count=${user_subreddits["${key}"]}
-            top_subreddits+=("${count}:${sub}")
-        fi
-    done
-    
-    # Sort and limit
-    local sorted_subs=$(printf '%s\n' "${top_subreddits[@]}" | sort -rn | head -2)
-    
-    log_info "Found ${#top_subreddits[@]} active subreddits, analyzing top 2..."
-    
-    # Analyze connections in top subreddits
-    local sub_count=0
-    while IFS=':' read -r count subreddit; do
-        [[ -z "${subreddit}" ]] && continue
-        
-        ((sub_count++))
-        echo ""
-        log_info "[${sub_count}/2] Analyzing r/${subreddit} (${count} activities)..."
-        
-        # Fetch recent posts from subreddit (reduced limit)
-        echo -n "  → Fetching recent posts..."
-        local subreddit_posts=$(timeout 15 fetch_subreddit_posts "${subreddit}" "new" 15 2>/dev/null)
-        
-        if [[ -z "${subreddit_posts}" ]] || [[ $? -ne 0 ]]; then
-            echo " ✗ (timeout/failed)"
-            continue
-        fi
-        echo " ✓"
-        
-        # Extract authors and create connections
-        local authors_found=0
-        while read -r post; do
-            # Check if we've reached max users
-            if [[ ${total_nodes} -ge ${max_users} ]]; then
-                log_warn "Reached maximum user limit (${max_users}), stopping..."
-                break 2
-            fi
+            local permalink=$(echo "${comment}" | jq -r '.data.permalink' 2>/dev/null)
             
-            local author=$(echo "${post}" | jq -r '.data.author' 2>/dev/null)
+            [[ -z "${comment_id}" ]] || [[ "${comment_id}" == "null" ]] && continue
             
-            # Skip invalid authors
-            if [[ "${author}" == "[deleted]" ]] || [[ "${author}" == "AutoModerator" ]] || [[ "${author}" == "null" ]] || [[ "${author}" == "${seed_username}" ]]; then
-                continue
-            fi
+            # Fetch replies to this comment
+            echo -n "  → Checking replies to comment ${comment_id}..."
+            local replies=$(timeout 10 bash -c "source '${SCRIPT_DIR}/utils/subshell_init.sh'; fetch_reddit_api_endpoint 'https://oauth.reddit.com${permalink}.json'" 2>/dev/null)
             
-            # Add to nodes
-            if [[ -z "${nodes[${author}]}" ]]; then
-                nodes["${author}"]="connected"
-                ((total_nodes++))
-                ((authors_found++))
-            fi
-            
-            # Create edge
-            local edge_key="${seed_username}->${author}"
-            if [[ -z "${edges[${edge_key}]}" ]]; then
-                edges["${edge_key}"]="${subreddit}"
-                interaction_count["${edge_key}"]=1
-                ((total_edges++))
+            if [[ -n "${replies}" ]]; then
+                # Extract reply authors
+                local reply_count=0
+                while read -r reply; do
+                    local reply_author=$(echo "${reply}" | jq -r '.data.author' 2>/dev/null)
+                    
+                    if [[ "${reply_author}" != "[deleted]" ]] && \
+                       [[ "${reply_author}" != "AutoModerator" ]] && \
+                       [[ "${reply_author}" != "null" ]] && \
+                       [[ "${reply_author}" != "${seed_username}" ]]; then
+                        
+                        # Add node
+                        if [[ -z "${nodes[${reply_author}]}" ]]; then
+                            if [[ ${total_nodes} -ge ${max_users} ]]; then
+                                break 3
+                            fi
+                            nodes["${reply_author}"]="connected"
+                            ((total_nodes++))
+                        fi
+                        
+                        # Create edge with separator that won't appear in usernames
+                        local edge_key="${reply_author}|||${seed_username}"
+                        if [[ -z "${edges[${edge_key}]}" ]]; then
+                            edges["${edge_key}"]="r/${subreddit}"
+                            interaction_types["${edge_key}"]="replied_to_comment"
+                            ((total_edges++))
+                            ((reply_count++))
+                            ((replies_found++))
+                        fi
+                    fi
+                done < <(echo "${replies}" | jq -c '.[1].data.children[]? | select(.kind == "t1")' 2>/dev/null)
+                
+                if [[ ${reply_count} -gt 0 ]]; then
+                    echo " found ${reply_count} replies"
+                else
+                    echo " no replies"
+                fi
             else
-                interaction_count["${edge_key}"]=$((${interaction_count["${edge_key}"]} + 1))
+                echo " failed"
             fi
             
-        done < <(echo "${subreddit_posts}" | jq -c '.data.children[]?' 2>/dev/null)
+            sleep 2  # Rate limiting
+            
+        done < <(echo "${comments_data}" | jq -c '.data.children[]?' 2>/dev/null | head -10)
+    fi
+    
+    echo "  Found ${replies_found} users who replied to comments"
+    
+    # METHOD 2: Find commenters on seed user's posts
+    local post_commenters=0
+    if [[ -n "${posts_data}" ]]; then
+        echo ""
+        log_info "Finding users who commented on u/${seed_username}'s posts..."
         
-        echo "  → Found ${authors_found} connected users in r/${subreddit}"
-        
-        # Rate limiting
-        sleep 2
-        
-    done <<< "${sorted_subs}"
+        while read -r post; do
+            local post_id=$(echo "${post}" | jq -r '.data.id' 2>/dev/null)
+            local subreddit=$(echo "${post}" | jq -r '.data.subreddit' 2>/dev/null)
+            local permalink=$(echo "${post}" | jq -r '.data.permalink' 2>/dev/null)
+            local num_comments=$(echo "${post}" | jq -r '.data.num_comments' 2>/dev/null)
+            
+            [[ -z "${post_id}" ]] || [[ "${post_id}" == "null" ]] || [[ "${num_comments}" == "0" ]] && continue
+            
+            echo -n "  → Checking ${num_comments} comments on post ${post_id}..."
+            local post_comments=$(timeout 10 bash -c "source '${SCRIPT_DIR}/utils/subshell_init.sh'; fetch_reddit_api_endpoint 'https://oauth.reddit.com${permalink}.json'" 2>/dev/null)
+            
+            if [[ -n "${post_comments}" ]]; then
+                local commenter_count=0
+                while read -r comment; do
+                    local commenter=$(echo "${comment}" | jq -r '.data.author' 2>/dev/null)
+                    
+                    if [[ "${commenter}" != "[deleted]" ]] && \
+                       [[ "${commenter}" != "AutoModerator" ]] && \
+                       [[ "${commenter}" != "null" ]] && \
+                       [[ "${commenter}" != "${seed_username}" ]]; then
+                        
+                        # Add node
+                        if [[ -z "${nodes[${commenter}]}" ]]; then
+                            if [[ ${total_nodes} -ge ${max_users} ]]; then
+                                break 3
+                            fi
+                            nodes["${commenter}"]="connected"
+                            ((total_nodes++))
+                        fi
+                        
+                        # Create edge
+                        local edge_key="${commenter}|||${seed_username}"
+                        if [[ -z "${edges[${edge_key}]}" ]]; then
+                            edges["${edge_key}"]="r/${subreddit}"
+                            interaction_types["${edge_key}"]="commented_on_post"
+                            ((total_edges++))
+                            ((commenter_count++))
+                            ((post_commenters++))
+                        fi
+                    fi
+                done < <(echo "${post_comments}" | jq -c '.[1].data.children[]? | select(.kind == "t1")' 2>/dev/null)
+                
+                if [[ ${commenter_count} -gt 0 ]]; then
+                    echo " found ${commenter_count} commenters"
+                else
+                    echo " no valid commenters"
+                fi
+            else
+                echo " failed"
+            fi
+            
+            sleep 2  # Rate limiting
+            
+        done < <(echo "${posts_data}" | jq -c '.data.children[]?' 2>/dev/null | head -10)
+    fi
+    
+    echo "  Found ${post_commenters} users who commented on posts"
     
     echo ""
     log_info "Network collection complete: ${total_nodes} nodes, ${total_edges} edges"
     
-    # Calculate metrics
-    declare -A node_degrees
-    declare -A in_degrees
-    declare -A out_degrees
+    # Calculate accurate metrics
+    declare -A in_degrees out_degrees node_degrees
     
     for edge_key in "${!edges[@]}"; do
-        local source=$(echo "${edge_key}" | cut -d'>' -f1 | tr -d '-')
-        local target=$(echo "${edge_key}" | cut -d'>' -f2)
+        # Split using ||| separator
+        local source="${edge_key%%|||*}"
+        local target="${edge_key#*|||}"
         
+        # Out-degree: edges going OUT from this user (they interacted)
+        out_degrees["${source}"]=$((${out_degrees[${source}]:-0} + 1))
+        
+        # In-degree: edges coming IN to this user (others interacted with them)
+        in_degrees["${target}"]=$((${in_degrees[${target}]:-0} + 1))
+        
+        # Total degree
         node_degrees["${source}"]=$((${node_degrees[${source}]:-0} + 1))
         node_degrees["${target}"]=$((${node_degrees[${target}]:-0} + 1))
-        out_degrees["${source}"]=$((${out_degrees[${source}]:-0} + 1))
-        in_degrees["${target}"]=$((${in_degrees[${target}]:-0} + 1))
     done
     
     # Find top 5 connected users
@@ -198,15 +218,25 @@ map_reddit_user_network() {
         avg_connections=$(awk "BEGIN {printf \"%.2f\", ${total_edges}/${total_nodes}}")
     fi
     
-    # Anomaly detection
+    # Anomaly detection (revised thresholds)
     local anomaly_score=0
     declare -a anomalies
     
     for username in "${!node_degrees[@]}"; do
         local degree=${node_degrees[${username}]}
-        if [[ ${degree} -gt 20 ]]; then
+        local in_deg=${in_degrees[${username}]:-0}
+        local out_deg=${out_degrees[${username}]:-0}
+        
+        # High interaction count
+        if [[ ${degree} -gt 15 ]]; then
             anomaly_score=$((anomaly_score + 5))
-            anomalies+=("User u/${username} has high connections: ${degree}")
+            anomalies+=("User u/${username} has high interaction count: ${degree}")
+        fi
+        
+        # Suspicious in-degree (many people interacting with them)
+        if [[ ${in_deg} -gt 10 ]] && [[ ${username} != "${seed_username}" ]]; then
+            anomaly_score=$((anomaly_score + 3))
+            anomalies+=("User u/${username} receives many interactions: ${in_deg} in-degree")
         fi
     done
     
@@ -218,7 +248,7 @@ map_reddit_user_network() {
         network_health="QUESTIONABLE"
     fi
     
-    # Build JSON outputs
+    # Build JSON outputs with proper escaping
     local nodes_json="["
     local first=true
     for username in "${!nodes[@]}"; do
@@ -228,21 +258,28 @@ map_reddit_user_network() {
         local out_deg=${out_degrees[${username}]:-0}
         local node_type="${nodes[${username}]}"
         
-        nodes_json+="{\"id\":\"${username}\",\"label\":\"u/${username}\",\"degree\":${degree},\"in_degree\":${in_deg},\"out_degree\":${out_deg},\"type\":\"${node_type}\"}"
+        # Escape username for JSON
+        local escaped_username=$(echo "${username}" | jq -R . | sed 's/^"//;s/"$//')
+        
+        nodes_json+="{\"id\":\"${escaped_username}\",\"label\":\"u/${escaped_username}\",\"degree\":${degree},\"in_degree\":${in_deg},\"out_degree\":${out_deg},\"type\":\"${node_type}\"}"
         first=false
     done
     nodes_json+="]"
-    
+
     local edges_json="["
     first=true
     for edge_key in "${!edges[@]}"; do
-        local source=$(echo "${edge_key}" | cut -d'>' -f1 | tr -d '-')
-        local target=$(echo "${edge_key}" | cut -d'>' -f2)
+        local source="${edge_key%%|||*}"
+        local target="${edge_key#*|||}"
         local subreddit="${edges[${edge_key}]}"
-        local weight=${interaction_count[${edge_key}]:-1}
+        local interaction_type="${interaction_types[${edge_key}]}"
+        
+        # Escape for JSON
+        local escaped_source=$(echo "${source}" | jq -R . | sed 's/^"//;s/"$//')
+        local escaped_target=$(echo "${target}" | jq -R . | sed 's/^"//;s/"$//')
         
         [[ "${first}" == "false" ]] && edges_json+=","
-        edges_json+="{\"source\":\"${source}\",\"target\":\"${target}\",\"subreddit\":\"${subreddit}\",\"weight\":${weight}}"
+        edges_json+="{\"source\":\"${escaped_source}\",\"target\":\"${escaped_target}\",\"location\":\"${subreddit}\",\"interaction_type\":\"${interaction_type}\"}"
         first=false
     done
     edges_json+="]"
@@ -251,8 +288,10 @@ map_reddit_user_network() {
     first=true
     while IFS=':' read -r degree username; do
         [[ -z "${username}" ]] && continue
+        local in_deg=${in_degrees[${username}]:-0}
+        local out_deg=${out_degrees[${username}]:-0}
         [[ "${first}" == "false" ]] && hubs_json+=","
-        hubs_json+="{\"username\":\"${username}\",\"connections\":${degree}}"
+        hubs_json+="{\"username\":\"${username}\",\"total_connections\":${degree},\"in_degree\":${in_deg},\"out_degree\":${out_deg}}"
         first=false
     done <<< "${top_hubs}"
     hubs_json+="]"
@@ -262,7 +301,7 @@ map_reddit_user_network() {
         anomalies_json=$(printf '%s\n' "${anomalies[@]}" | jq -R . | jq -s .)
     fi
     
-    # Network density
+    # Network density (directed graph)
     local max_possible_edges=0
     if [[ ${total_nodes} -gt 1 ]]; then
         max_possible_edges=$((total_nodes * (total_nodes - 1)))
@@ -281,6 +320,7 @@ map_reddit_user_network() {
     "seed_user": "${seed_username}",
     "analysis_depth": ${depth},
     "max_users_limit": ${max_users},
+    "methodology": "Detects actual interactions: replies to comments and comments on posts",
     "network_metrics": {
         "total_nodes": ${total_nodes},
         "total_edges": ${total_edges},
@@ -305,7 +345,7 @@ EOF
     echo ""
     echo "=== NETWORK SUMMARY ==="
     echo "  Users analyzed: ${total_nodes}"
-    echo "  Connections found: ${total_edges}"
+    echo "  Actual interactions found: ${total_edges}"
     echo "  Network health: ${network_health}"
     echo "  Anomaly score: ${anomaly_score}/100"
     echo ""
@@ -317,12 +357,14 @@ EOF
     local rank=1
     while IFS=':' read -r degree username; do
         [[ -z "${username}" ]] && continue
-        echo "  ${rank}. u/${username} - ${degree} connections"
+        local in_deg=${in_degrees[${username}]:-0}
+        local out_deg=${out_degrees[${username}]:-0}
+        echo "  ${rank}. u/${username} - ${degree} total (${in_deg} in, ${out_deg} out)"
         ((rank++))
     done <<< "${top_hubs}"
 }
 
-# Quick network snapshot (fast mode)
+# Quick network snapshot (unchanged)
 quick_network_snapshot() {
     local username=$1
     local output_file="${DATA_DIR}/network_quick_${username}_$(date +%Y%m%d_%H%M%S).json"
@@ -330,8 +372,7 @@ quick_network_snapshot() {
     log_info "Quick network snapshot for u/${username}"
     
     echo -n "Fetching user data..."
-    local user_data=$(timeout 10 fetch_reddit_user "${username}" 2>/dev/null)
-    
+    local user_data=$(timeout 10 bash -c "source '${SCRIPT_DIR}/utils/subshell_init.sh'; fetch_reddit_user '${username}'" 2>/dev/null)
     if [[ -z "${user_data}" ]]; then
         echo " ✗"
         log_error "Failed to fetch user"
@@ -340,14 +381,13 @@ quick_network_snapshot() {
     echo " ✓"
     
     echo -n "Analyzing recent activity..."
-    local comments=$(timeout 10 fetch_reddit_user_comments "${username}" 50 2>/dev/null)
-    local posts=$(timeout 10 fetch_reddit_user_posts "${username}" 50 2>/dev/null)
+    local comments=$(timeout 10 bash -c "source '${SCRIPT_DIR}/utils/subshell_init.sh'; fetch_reddit_user_comments '${username}' 50" 2>/dev/null)
+    local posts=$(timeout 10 bash -c "source '${SCRIPT_DIR}/utils/subshell_init.sh'; fetch_reddit_user_posts '${username}' 50" 2>/dev/null)
     echo " ✓"
     
     declare -A subreddit_activity
     local total_activity=0
     
-    # Process comments
     if [[ -n "${comments}" ]]; then
         while read -r comment; do
             local sub=$(echo "${comment}" | jq -r '.data.subreddit' 2>/dev/null)
@@ -356,7 +396,6 @@ quick_network_snapshot() {
         done < <(echo "${comments}" | jq -c '.data.children[]?' 2>/dev/null)
     fi
     
-    # Process posts
     if [[ -n "${posts}" ]]; then
         while read -r post; do
             local sub=$(echo "${post}" | jq -r '.data.subreddit' 2>/dev/null)

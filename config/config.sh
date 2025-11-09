@@ -61,7 +61,7 @@ export MIN_KARMA_RATIO="${MIN_KARMA_RATIO:-0.1}"
 export SUSPICIOUS_LINK_PATTERNS=("bit.ly" "tinyurl" "goo.gl" "t.co" "rebrand.ly")
 
 # Rate Limiting (Reddit: 100 req/min for OAuth)
-export API_RATE_LIMIT="${API_RATE_LIMIT:-90}"
+export API_RATE_LIMIT="${API_RATE_LIMIT:-60}"  # Reduced from 90 to be safer
 export RATE_LIMIT_WINDOW="${RATE_LIMIT_WINDOW:-60}"
 
 # Monitored subreddits

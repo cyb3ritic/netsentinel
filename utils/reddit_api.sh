@@ -83,48 +83,65 @@ check_reddit_rate_limit() {
 reddit_api_request() {
     local endpoint=$1
     local method=${2:-GET}
+    local max_retries=3
+    local retry_count=0
     
-    check_reddit_rate_limit
+    while [[ ${retry_count} -lt ${max_retries} ]]; do
+        check_reddit_rate_limit
+        
+        local token=$(get_reddit_token) || {
+            log_error "Failed to get token (attempt $((retry_count + 1)))"
+            sleep $((retry_count + 1))
+            ((retry_count++))
+            continue
+        }
+
+        local temp_file=$(mktemp)
+        
+        log_debug "Reddit API: ${method} ${endpoint} (attempt $((retry_count + 1)))"
+        
+        local http_code
+        http_code=$(curl -s -w "%{http_code}" -o "${temp_file}" \
+            -X "${method}" \
+            -H "Authorization: Bearer ${token}" \
+            -H "User-Agent: ${REDDIT_USER_AGENT}" \
+            --connect-timeout "${CURL_TIMEOUT}" \
+            --max-time $((CURL_TIMEOUT * 2)) \
+            "${REDDIT_OAUTH_URL}${endpoint}")
+        
+        local response
+        response=$(cat "${temp_file}")
+        rm -f "${temp_file}"
+
+        case ${http_code} in
+            200)
+                echo "${response}"
+                return 0
+                ;;
+            401)
+                log_warn "Token expired, refreshing..."
+                rm -f "${TOKEN_FILE}"
+                sleep 1
+                ;;
+            429)
+                log_warn "Rate limited, waiting..."
+                sleep $((5 + retry_count * 2))
+                ;;
+            5*)
+                log_warn "Server error (${http_code}), retrying..."
+                sleep $((2 + retry_count))
+                ;;
+            *)
+                log_error "HTTP ${http_code}: ${response}"
+                sleep 1
+                ;;
+        esac
+        
+        ((retry_count++))
+    done
     
-    local token=$(get_reddit_token)
-    if [[ -z "${token}" ]]; then
-        return 1
-    fi
-    
-    local url="${REDDIT_OAUTH_URL}${endpoint}"
-    local temp_file=$(mktemp)
-    
-    log_debug "Reddit API: ${method} ${endpoint}"
-    
-    local http_code=$(curl -s -w "%{http_code}" -o "${temp_file}" \
-        -X "${method}" \
-        -H "Authorization: Bearer ${token}" \
-        -H "User-Agent: ${REDDIT_USER_AGENT}" \
-        --connect-timeout "${CURL_TIMEOUT}" \
-        "${url}")
-    
-    local response=$(cat "${temp_file}")
-    rm -f "${temp_file}"
-    
-    case ${http_code} in
-        200)
-            echo "${response}"
-            return 0
-            ;;
-        401)
-            log_warn "Token expired, retrying..."
-            rm -f "${TOKEN_FILE}"
-            return 1
-            ;;
-        429)
-            log_error "Rate limit exceeded"
-            return 1
-            ;;
-        *)
-            log_error "HTTP ${http_code}: ${response}"
-            return 1
-            ;;
-    esac
+    log_error "Failed after ${max_retries} attempts"
+    return 1
 }
 
 # Fetch user profile
@@ -175,3 +192,8 @@ fetch_post_comments() {
     local post_id=$2
     reddit_api_request "/r/${subreddit}/comments/${post_id}.json"
 }
+
+# Export functions to make them visible to sub-processes like 'timeout'
+export -f get_reddit_token check_reddit_rate_limit reddit_api_request
+export -f fetch_reddit_user fetch_reddit_user_posts fetch_reddit_user_comments
+export -f search_reddit fetch_subreddit_posts fetch_post_comments

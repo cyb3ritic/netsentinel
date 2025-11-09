@@ -69,3 +69,7 @@ log_custom() {
     local message=$2
     log_message "${level}" "${message}" "${NC}"
 }
+
+
+# Export functions to make them visible to sub-processes
+export -f log_message log_debug log_info log_warn log_error log_critical log_success log_custom
